@@ -1,72 +1,51 @@
-name: Build and Release
+variables:
+  GIT_TAG: "1.23.148-t7c7f37342-gb4f8e7f90a4"
+  GIT_REPO: "tailscale/tailscale-android"
 
-on:
- push:
-   branches:
-     - main
-     - "tailscale-android/*"
-   tags:
-     - "v*.*.*"
- pull_request:
-   branches:
-     - master
-     - "tailscale-android/*"
+stages:
+  - docker
+  - build
+  - upload
 
-jobs:
- apk:
-   name: Generate APK
-   runs-on: ubuntu-latest
-   steps:
-     - name: Checkout
-       uses: actions/checkout@v2.4.0
-     - name: Branch name
-       run: echo running on branch ${GITHUB_REF##*/}
-     - name: Setup JDK
-       uses: actions/setup-java@v2.5.0
-       with:
-         distribution: temurin
-         java-version: "11"
-     - name: Set execution flag for gradlew
-       run: chmod +x gradlew
-     - name: Build APK
-       run: bash ./gradlew assembleDebug --stacktrace
-     - name: Upload APK
-       uses: actions/upload-artifact@v1
-       with:
-         name: apk
-         path: app/build/outputs/apk/debug/app-debug.apk
+.fetch-repo: &fetch-repo
+  - curl -o tailscale-android.zip https://codeload.github.com/${GIT_REPO}/zip/refs/tags/${GIT_TAG}
+  - unzip -q tailscale-android.zip
+  - mv -n tailscale-android-${GIT_TAG}/* .
+  - rm -rf tailscale-android.zip tailscale-android-${GIT_TAG}
 
- release:
-   name: Release APK
-   needs: apk
-   runs-on: ubuntu-latest
-   steps:
-     - name: Get branch name
-       id: branch-name
-       uses: tj-actions/branch-names@v5.1
-     - name: Print branch    
-       run: |
-         echo "Running on default: ${{ steps.branch-name.outputs.current_branch }}"
-       
-     - name: Download APK from build
-       uses: actions/download-artifact@v1
-       with:
-         name: apk
-     - name: Create Release
-       id: create_release
-       uses: actions/create-release@v1
-       env:
-         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-       with:
-         tag_name: ${{ github.run_number }}
-         release_name: ${{ github.event.repository.name }}  ${{ steps.branch-name.outputs.current_branch }} v${{ github.run_number }}.${{ github.run_attempt }}
-     - name: Upload Release APK
-       id: upload_release_asset
-       uses: actions/upload-release-asset@v1.0.1
-       env:
-         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-       with:
-         upload_url: ${{ steps.create_release.outputs.upload_url }}
-         asset_path: apk/app-debug.apk
-         asset_name: ${{ github.event.repository.name }}  ${{ steps.branch-name.outputs.current_branch }} v${{ github.run_number }}.${{ github.run_attempt }}.apk
-         asset_content_type: application/zip
+build-image:
+  stage: docker
+  image: docker:20.10
+  services:
+    - docker:20.10-dind
+  variables:
+    DOCKER_DRIVER: overlay2
+    DOCKER_TLS_CERTDIR: "/certs"
+  script:
+    - apk add curl
+    - *fetch-repo
+    - docker login -u gitlab-ci-token -p ${CI_BUILD_TOKEN} ${CI_REGISTRY}
+    - docker pull ${CI_REGISTRY_IMAGE} || true
+    - docker build --cache-from ${CI_REGISTRY_IMAGE} --tag ${CI_REGISTRY_IMAGE} .
+    - docker push ${CI_REGISTRY_IMAGE}
+
+build-apk:
+  stage: build
+  image: ${CI_REGISTRY_IMAGE}
+  script:
+    - apt-get install -y patch
+    - *fetch-repo
+    - sed -i "s|@LOGIN_SERVER_URL@|${LOGIN_SERVER_URL}|g" backend.patch
+    - patch -p0 < backend.patch
+    - make tailscale-fdroid.apk
+  artifacts:
+    paths:
+      - tailscale-fdroid.apk
+
+upload-apk:
+  stage: upload
+  image: curlimages/curl:latest
+  script:
+    - export TAILSCALE_APK=tailscale-fdroid.apk
+    - export TAILSCALE_VERSION=$(echo ${GIT_TAG} | cut -d - -f 1)
+    - 'curl --header "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file ${TAILSCALE_APK} ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/tailscale/${TAILSCALE_VERSION}/${TAILSCALE_APK}'
